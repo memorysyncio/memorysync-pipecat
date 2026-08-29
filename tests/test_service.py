@@ -252,61 +252,47 @@ async def test_missing_user_id_is_loud_at_construction(mock):
         MemorySyncMemoryService(api_key="ms_x", user_id="", transport=mock.transport())
 
 
-# ── capture: turn-complete merging (voice fragmenting) ────────────────
+# ── capture: immediate and loss-proof ─────────────────────────────────
 
 
-async def test_speech_fragments_merge_into_one_turn(mock, make_service):
-    """VAD pauses split one utterance across context messages — they must
-    store as ONE merged row when the assistant reply completes the turn,
-    never as per-fragment junk rows ("and", "dinner", …)."""
+async def test_current_utterance_stores_before_any_reply(mock, make_service):
+    """The user's words must be in flight the moment the frame passes —
+    BEFORE the LLM replies — so a disconnect can never lose them."""
     service = make_service()
-    fragments = [
-        "Do you know that my favorite",
-        "dinner",
-        "and",
-        "dinner is my favorite dish is biryani.",
+    ctx = context_of([
+        {"role": "user", "content": "My age is twenty two and I completed my bachelor's."},
+    ])
+    await drive(service, ctx)
+    await drain(mock, 1)
+    assert [r["text"] for r in mock.rows] == [
+        "human: My age is twenty two and I completed my bachelor's."
     ]
-    # The aggregator's view grows frame by frame while the user speaks…
-    growing = [
-        context_of([{"role": "user", "content": f} for f in fragments[: i + 1]])
-        for i in range(len(fragments))
-    ]
-    # …and the turn completes when the assistant replies.
-    completed = context_of(
-        [{"role": "user", "content": f} for f in fragments]
-        + [{"role": "assistant", "content": "Got it, biryani it is!"}]
-    )
-    await drive(service, *growing, completed)
-    await drain(mock, 2)
 
+
+async def test_demo_disconnect_sequence_loses_nothing(mock, make_service):
+    """The exact sequence that lost data in 1.1.0: greeting frame, then a
+    frame carrying the reply + the important utterance, then immediate
+    CancelFrame (browser disconnect). Every message must already be
+    stored — nothing may depend on a post-cancel flush window."""
+    service = make_service()
+    f1 = context_of([{"role": "user", "content": "Hello there, anyone home?"}])
+    f2 = context_of([
+        {"role": "user", "content": "Hello there, anyone home?"},
+        {"role": "assistant", "content": "Hi! How can I help you today?"},
+        {"role": "user", "content": "My age is twenty two and I completed my bachelor's."},
+    ])
+    await drive(service, f1, f2)  # run_test tears the pipeline down right after
+    await drain(mock, 3)
     texts = sorted(r["text"] for r in mock.rows)
     assert texts == [
-        "ai: Got it, biryani it is!",
-        "human: Do you know that my favorite dinner and dinner is my favorite dish is biryani.",
+        "ai: Hi! How can I help you today?",
+        "human: Hello there, anyone home?",
+        "human: My age is twenty two and I completed my bachelor's.",
     ]
-    assert mock.add_turn_calls() == 2, "four fragments + one reply = exactly two rows"
 
 
-async def test_in_progress_utterance_flushes_once_at_end_of_call(mock, make_service):
-    """A call that ends mid-utterance (no reply coming) must not lose the
-    tail — and must store it merged, not per fragment."""
-    service = make_service()
-    ctx1 = context_of([{"role": "user", "content": "my name is Abdullah"}])
-    ctx2 = context_of([
-        {"role": "user", "content": "my name is Abdullah"},
-        {"role": "user", "content": "and my favorite color is black"},
-    ])
-    await drive(service, ctx1, ctx2)  # run_test's EndFrame triggers the flush
-    await drain(mock, 1)
-
-    assert [r["text"] for r in mock.rows] == [
-        "human: my name is Abdullah and my favorite color is black"
-    ]
-    assert mock.add_turn_calls() == 1
-
-
-async def test_failed_store_releases_fragments_for_retry(mock, make_service):
-    """A store that never landed must not consume its messages — the next
+async def test_failed_store_releases_message_for_retry(mock, make_service):
+    """A store that never landed must not consume its message — the next
     frame re-captures and retries, converging on one row."""
     service = make_service()
     mock.fail_next = 503

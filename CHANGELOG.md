@@ -2,6 +2,19 @@
 
 All notable changes to `pipecat-memorysync` are documented here.
 
+## 1.1.1 — 2026-08-29
+
+- **Immediate, loss-proof capture.** 1.1.0's turn-complete merging
+  deferred the current utterance until the turn completed — on a browser
+  disconnect that deferral raced the brief cancel salvage window and
+  could lose the newest (usually most important) turn over slow
+  networks. Capture is immediate again: every new user/assistant message
+  is in flight the moment its frame passes, BEFORE the LLM replies.
+  Junk filtering and fact extraction now happen server-side (the
+  platform's low-value gate + conversational ingestion), so client-side
+  merging is unnecessary. Suite: 17 checks on Pipecat v1.8.1, including
+  the exact disconnect sequence that previously lost data.
+
 ## 1.1.0 — 2026-08-29
 
 - **Turn-complete capture.** Voice aggregators split one utterance across
