@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-memorysync"
+dynamic = ["version"]
+description = "MemorySync for Pipecat: budgeted memory recall that never stalls a voice reply, delta-only conversation persistence with idempotency seeds, and a pipeline that cannot be broken by a memory outage."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "MemorySync", email = "support@memorysync.io" }]
+keywords = ["pipecat", "voice", "agents", "memory", "memorysync", "long-term-memory"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Conferencing",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pipecat-ai>=1.0.0,<2",
+    "httpx>=0.25,<1",
+]
+
+[project.urls]
+Homepage = "https://docs.memorysync.io/guides/pipecat"
+Documentation = "https://docs.memorysync.io/guides/pipecat"
+Repository = "https://github.com/memorysyncio/memorysync-pipecat"
+Changelog = "https://github.com/memorysyncio/memorysync-pipecat/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/pipecat_memorysync/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_memorysync"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
