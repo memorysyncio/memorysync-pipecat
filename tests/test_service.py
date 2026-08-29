@@ -250,3 +250,75 @@ async def test_conveniences_answer(mock, make_service):
 async def test_missing_user_id_is_loud_at_construction(mock):
     with pytest.raises(ValueError, match="user_id"):
         MemorySyncMemoryService(api_key="ms_x", user_id="", transport=mock.transport())
+
+
+# ── capture: turn-complete merging (voice fragmenting) ────────────────
+
+
+async def test_speech_fragments_merge_into_one_turn(mock, make_service):
+    """VAD pauses split one utterance across context messages — they must
+    store as ONE merged row when the assistant reply completes the turn,
+    never as per-fragment junk rows ("and", "dinner", …)."""
+    service = make_service()
+    fragments = [
+        "Do you know that my favorite",
+        "dinner",
+        "and",
+        "dinner is my favorite dish is biryani.",
+    ]
+    # The aggregator's view grows frame by frame while the user speaks…
+    growing = [
+        context_of([{"role": "user", "content": f} for f in fragments[: i + 1]])
+        for i in range(len(fragments))
+    ]
+    # …and the turn completes when the assistant replies.
+    completed = context_of(
+        [{"role": "user", "content": f} for f in fragments]
+        + [{"role": "assistant", "content": "Got it, biryani it is!"}]
+    )
+    await drive(service, *growing, completed)
+    await drain(mock, 2)
+
+    texts = sorted(r["text"] for r in mock.rows)
+    assert texts == [
+        "ai: Got it, biryani it is!",
+        "human: Do you know that my favorite dinner and dinner is my favorite dish is biryani.",
+    ]
+    assert mock.add_turn_calls() == 2, "four fragments + one reply = exactly two rows"
+
+
+async def test_in_progress_utterance_flushes_once_at_end_of_call(mock, make_service):
+    """A call that ends mid-utterance (no reply coming) must not lose the
+    tail — and must store it merged, not per fragment."""
+    service = make_service()
+    ctx1 = context_of([{"role": "user", "content": "my name is Abdullah"}])
+    ctx2 = context_of([
+        {"role": "user", "content": "my name is Abdullah"},
+        {"role": "user", "content": "and my favorite color is black"},
+    ])
+    await drive(service, ctx1, ctx2)  # run_test's EndFrame triggers the flush
+    await drain(mock, 1)
+
+    assert [r["text"] for r in mock.rows] == [
+        "human: my name is Abdullah and my favorite color is black"
+    ]
+    assert mock.add_turn_calls() == 1
+
+
+async def test_failed_store_releases_fragments_for_retry(mock, make_service):
+    """A store that never landed must not consume its messages — the next
+    frame re-captures and retries, converging on one row."""
+    service = make_service()
+    mock.fail_next = 503
+    turn = [
+        {"role": "user", "content": "remember that I fly out of Hyderabad"},
+        {"role": "assistant", "content": "Noted!"},
+    ]
+    await drive(service, context_of(turn))
+    await asyncio.sleep(0.3)  # the 503 lands on exactly one of the two stores
+
+    await drive(service, context_of(turn))  # same context re-seen → retry
+    await drain(mock, 2)
+
+    texts = sorted(r["text"] for r in mock.rows)
+    assert texts == ["ai: Noted!", "human: remember that I fly out of Hyderabad"]

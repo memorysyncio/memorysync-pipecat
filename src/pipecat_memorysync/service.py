@@ -7,9 +7,13 @@ predecessors don't:
 1. **Recall is budgeted.** Enrichment waits at most ``recall_timeout``
    seconds (default 1.2). On timeout or failure the context frame passes
    through unenriched — a voice reply is never stalled by a slow network.
-2. **Capture is delta-only.** Each turn stores only the messages that are
-   NEW since the last frame, verbatim, with cross-adapter fnv1a64
-   idempotency seeds — not the whole conversation re-sent every turn.
+2. **Capture is turn-complete and delta-only.** Voice aggregators split
+   one utterance across several context messages at speech pauses; this
+   service merges consecutive new user fragments and stores them as ONE
+   verbatim turn once the assistant's reply marks the turn complete (the
+   in-progress tail is flushed at end of call). Only NEW messages are
+   considered each frame — never the whole conversation re-sent — and
+   every stored turn carries a cross-adapter fnv1a64 idempotency seed.
 3. **Nothing raises, nothing is dropped.** Every failure path logs and
    pushes the ORIGINAL frame through. The pipeline cannot stall and the
    LLM always gets its context.
@@ -137,6 +141,14 @@ class MemorySyncMemoryService(FrameProcessor):
         self.params = params
 
         self._stored_seeds: Set[str] = set()
+        # Message-level consumption ledger: which context messages have
+        # been merged into a stored turn. Distinct from _stored_seeds
+        # (which dedups at merged-turn granularity) so a failed store can
+        # release its messages for re-capture on the next frame.
+        self._seen_messages: Set[str] = set()
+        # Snapshot of the in-progress user utterance (fragments after the
+        # last assistant reply) — flushed as one turn at end of call.
+        self._tail_pending: List[tuple[str, str]] = []
         self._store_tasks: Set[asyncio.Task] = set()
         self._last_query: Optional[str] = None
 
@@ -237,11 +249,25 @@ class MemorySyncMemoryService(FrameProcessor):
         body = "\n".join(lines)
         return f"{self.params.system_prompt}\n{body}\n\n{CONTEXT_GUARD}"
 
-    # ── capture: delta-only, background ────────────────────────────────
+    # ── capture: turn-complete, delta-only, background ─────────────────
 
     def _capture_delta(self, context: Any) -> None:
-        """Queue storage for messages NOT seen before. O(new), not O(all)."""
+        """Queue storage for completed turns built from NEW messages only.
+
+        Voice aggregators append each speech fragment as its own user
+        message ("Do you know that my favorite", "dinner", "and", …).
+        Storing them individually floods memory with junk rows, so:
+
+        - consecutive NEW user messages merge into ONE turn, stored the
+          moment an assistant message follows them (turn completed);
+        - user messages after the last assistant reply are an in-progress
+          utterance — they stay pending (snapshotted for the end-of-call
+          flush) instead of being stored piecemeal;
+        - NEW assistant messages store immediately, flushing any pending
+          user group first so ordering survives.
+        """
         header = self.params.system_prompt
+        entries: List[tuple[str, str]] = []  # (speaker_role, trimmed_text)
         for message in context.get_messages():
             role = message.get("role")
             if role not in ("user", "assistant"):
@@ -251,19 +277,78 @@ class MemorySyncMemoryService(FrameProcessor):
                 continue  # our own injection (user-role mode) never re-enters
             speaker_role = "human" if role == "user" else "ai"
             trimmed = text if len(text) <= MAX_TURN_CHARS else text[:MAX_TURN_CHARS] + "…"
-            seed = f"{speaker_role}:{trimmed}"
-            if seed in self._stored_seeds:
-                continue
-            self._stored_seeds.add(seed)
-            if len(self._stored_seeds) > 4096:
-                self._stored_seeds.clear()
-            # Plain asyncio tasks, tracked locally: pipeline teardown must
-            # not cancel a persist mid-flight — _flush owns their fate.
-            task = asyncio.create_task(self._store_turn(speaker_role, trimmed, seed))
-            self._store_tasks.add(task)
-            task.add_done_callback(self._store_tasks.discard)
+            entries.append((speaker_role, trimmed))
 
-    async def _store_turn(self, speaker_role: str, text: str, seed: str) -> None:
+        last_ai = -1
+        for index, (speaker_role, _text) in enumerate(entries):
+            if speaker_role == "ai":
+                last_ai = index
+
+        group_texts: List[str] = []
+        group_keys: List[str] = []
+        for index, (speaker_role, text) in enumerate(entries):
+            key = f"{speaker_role}:{text}"
+            if speaker_role == "human":
+                if index > last_ai:
+                    continue  # in-progress utterance — tail snapshot below
+                if key in self._seen_messages:
+                    continue
+                group_texts.append(text)
+                group_keys.append(key)
+            else:
+                if group_texts:
+                    self._store_merged(group_texts, group_keys)
+                    group_texts, group_keys = [], []
+                if key not in self._seen_messages:
+                    self._seen_messages.add(key)
+                    self._bound_seen()
+                    self._queue_store("ai", text, [key])
+
+        self._tail_pending = [
+            (text, f"human:{text}")
+            for speaker_role, text in entries[last_ai + 1:]
+            if speaker_role == "human" and f"human:{text}" not in self._seen_messages
+        ]
+
+    def _store_merged(self, texts: List[str], keys: List[str]) -> None:
+        """One utterance from its fragments: mark consumed, merge, store."""
+        for key in keys:
+            self._seen_messages.add(key)
+        self._bound_seen()
+        merged = " ".join(texts)
+        if len(merged) > MAX_TURN_CHARS:
+            merged = merged[:MAX_TURN_CHARS] + "…"
+        self._queue_store("human", merged, keys)
+
+    def _flush_tail(self) -> None:
+        """Store the in-progress utterance (end-of-call, no reply coming)."""
+        if not self._tail_pending:
+            return
+        texts = [text for text, _key in self._tail_pending]
+        keys = [key for _text, key in self._tail_pending]
+        self._tail_pending = []
+        self._store_merged(texts, keys)
+
+    def _bound_seen(self) -> None:
+        if len(self._seen_messages) > 4096:
+            self._seen_messages.clear()
+
+    def _queue_store(self, speaker_role: str, text: str, msg_keys: List[str]) -> None:
+        seed = f"{speaker_role}:{text}"
+        if seed in self._stored_seeds:
+            return
+        self._stored_seeds.add(seed)
+        if len(self._stored_seeds) > 4096:
+            self._stored_seeds.clear()
+        # Plain asyncio tasks, tracked locally: pipeline teardown must
+        # not cancel a persist mid-flight — _flush owns their fate.
+        task = asyncio.create_task(self._store_turn(speaker_role, text, seed, msg_keys))
+        self._store_tasks.add(task)
+        task.add_done_callback(self._store_tasks.discard)
+
+    async def _store_turn(
+        self, speaker_role: str, text: str, seed: str, msg_keys: List[str]
+    ) -> None:
         try:
             tenant = await self._api.resolve_tenant_id()
             await self._api.add_turn(
@@ -274,7 +359,11 @@ class MemorySyncMemoryService(FrameProcessor):
                 metadata={"session_id": self.scope},
             )
         except Exception as exc:  # noqa: BLE001
-            self._stored_seeds.discard(seed)  # the write never landed; retry later
+            # The write never landed: release both ledgers so the next
+            # frame re-captures these messages and retries the store.
+            self._stored_seeds.discard(seed)
+            for key in msg_keys:
+                self._seen_messages.discard(key)
             logger.debug(f"memorysync: store failed: {exc}")
 
     # ── conveniences (outside the pipeline) ───────────────────────────
@@ -303,7 +392,12 @@ class MemorySyncMemoryService(FrameProcessor):
     # ── lifecycle ──────────────────────────────────────────────────────
 
     async def _flush(self, *, timeout: float) -> None:
-        """Let queued stores land, bounded. Never raises."""
+        """Store the in-progress utterance, then let queued stores land,
+        bounded. Never raises."""
+        try:
+            self._flush_tail()
+        except Exception:  # noqa: BLE001
+            pass
         pending = [t for t in self._store_tasks if not t.done()]
         if not pending:
             return

@@ -2,6 +2,19 @@
 
 All notable changes to `pipecat-memorysync` are documented here.
 
+## 1.1.0 — 2026-08-29
+
+- **Turn-complete capture.** Voice aggregators split one utterance across
+  several context messages at speech pauses; those fragments previously
+  stored as separate rows ("and", "dinner", …). Consecutive new user
+  fragments now merge into ONE verbatim turn, stored when the assistant
+  reply completes the turn; an in-progress utterance is flushed as one
+  merged turn at end of call. Assistant turns still store immediately,
+  and a failed store releases its fragments for retry on the next frame.
+- Delta-only and idempotency guarantees unchanged; suite grows to 17
+  checks on Pipecat v1.8.1 (fragment merging, end-of-call tail flush,
+  failed-store retry).
+
 ## 1.0.1 — 2026-08-29
 
 - Metadata only: the source repository moved to

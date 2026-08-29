@@ -57,6 +57,10 @@ enriched or not, on time.
 - **Budgeted recall.** Enrichment runs under a hard timeout (default
   **1.2 s**). A slow or dead memory backend means an unenriched frame, never a
   stalled voice reply.
+- **Turn-complete capture.** Voice aggregators split one utterance across
+  several context messages at speech pauses; consecutive fragments merge
+  into ONE stored turn when the assistant's reply completes it (the
+  in-progress tail flushes at end of call) — no per-fragment junk rows.
 - **Delta-only capture.** Only messages *not seen before* are stored, tracked
   by deterministic idempotency seeds. Growing a 50-message context does not
   re-store 50 messages per turn.
