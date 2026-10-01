@@ -1,11 +1,23 @@
 """Shared plumbing: the same stateful httpx-mock MemorySync as the
-LiveKit adapter's suite, for the Pipecat service."""
+LiveKit adapter's suite, for the Pipecat service.
+
+``POST /v1/memory/add_turn`` follows the server contract: a turn is never
+stored as a row. A USER turn stores one "fact" — the turn text with any
+role prefix removed, the caller's scalar metadata plus ``write_origin:
+"turn-extraction"`` and ``turn_role: "user"``; assistant/system/tool
+turns store nothing (``skipped_non_user_turn``); filler stores nothing
+(``skipped_low_value``); a replay of the same (speaker, occurred_at,
+text) stores nothing and answers ``already_exists: true``. ``memory_id``
+is always null.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,28 +27,45 @@ import pytest
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "src"))
 
+_HUMAN = {"human", "user", "customer", "caller"}
+_PREFIX = re.compile(r"^\s*(human|user|ai|assistant)\s*:\s*", re.IGNORECASE)
+_RESERVED = {"write_origin", "distilled_from", "turn_role", "history_id", "episodic"}
+_FILLER = {"ok", "okay", "yes", "no", "sure", "thanks", "thank", "you", "hi", "hello", "hey", "bye"}
+
+
+def _norm(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return "user" if value.strip().lower() in _HUMAN else "assistant"
+
+
+def _is_filler(text: str) -> bool:
+    words = re.findall(r"[a-z']+", text.lower())
+    return len(words) <= 1 or (len(words) == 2 and all(w in _FILLER for w in words))
+
 
 class MockMemorySync:
     def __init__(self, tenant_id: str = "org_1") -> None:
         self.tenant_id = tenant_id
+        #: Memory rows: seeded facts plus the facts extracted from user turns.
         self.rows: List[Dict[str, Any]] = []
         self.requests: List[httpx.Request] = []
+        #: (user_id, speaker, occurred_at, text) of every user turn extracted.
+        self.receipts: set = set()
+        #: processing_status of every add_turn answer, in order.
+        self.outcomes: List[str] = []
         self._next_id = 1
         self.fail_next: Optional[int] = None
+        #: Fail only the next add_turn call (tenant/recall calls unaffected).
+        self.fail_next_add_turn: Optional[int] = None
         self.recall_returns_empty = False
         self.quota_mode: Optional[str] = None
         self.delay_s = 0.0
 
     def seed(self, user_id: str, text: str) -> None:
+        """A fact already in memory (as if extracted from an earlier call)."""
         self.rows.append(
-            {
-                "id": self._alloc(),
-                "user_id": user_id,
-                "text": text,
-                "speaker": f"seed#{self._next_id}",
-                "metadata": None,
-                "_seed": f"seed-{self._next_id}",
-            }
+            {"id": self._alloc(), "user_id": user_id, "text": text, "metadata": None}
         )
 
     def _alloc(self) -> int:
@@ -49,6 +78,20 @@ class MockMemorySync:
 
     def add_turn_calls(self) -> int:
         return sum(1 for r in self.requests if r.url.path == "/v1/memory/add_turn")
+
+    def add_turn_bodies(self) -> List[Dict[str, Any]]:
+        return [
+            json.loads(r.content.decode("utf-8"))
+            for r in self.requests
+            if r.url.path == "/v1/memory/add_turn"
+        ]
+
+    def facts(self) -> List[Dict[str, Any]]:
+        """Rows extracted from add_turn (seeded rows excluded)."""
+        return [
+            r for r in self.rows
+            if (r.get("metadata") or {}).get("write_origin") == "turn-extraction"
+        ]
 
     _METERED_ADDS = {("POST", "/v1/memory/add_turn")}
     _METERED_READS = {("POST", "/v1/memory/recall"), ("POST", "/v1/memory/query")}
@@ -71,8 +114,72 @@ class MockMemorySync:
                 },
             )
         if is_add:
-            return httpx.Response(200, json={"status": "ok"})
+            self.outcomes.append("skipped")
+            return httpx.Response(
+                201,
+                json={
+                    "memory_id": None,
+                    "status": "ok",
+                    "processing_status": "skipped",
+                    "embed_mode": "none",
+                    "already_exists": False,
+                    "request_id": None,
+                },
+            )
         return httpx.Response(200, json={"memories": []})
+
+    def _add_turn(self, body: Dict[str, Any]) -> httpx.Response:
+        def answer(processing_status: str, *, already: bool = False, request_id=None):
+            self.outcomes.append(processing_status)
+            return httpx.Response(
+                201,
+                json={
+                    "memory_id": None,
+                    "status": "processing" if request_id else "ok",
+                    "processing_status": processing_status,
+                    "embed_mode": "none",
+                    "already_exists": already,
+                    "request_id": request_id,
+                },
+            )
+
+        text = str(body.get("text") or "")
+        speaker = body.get("speaker")
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        match = _PREFIX.match(text)
+        content = (text[match.end():] if match else text).strip()
+        head = speaker.split("@", 1)[0] if isinstance(speaker, str) and "@" in speaker else None
+        role = (
+            _norm(body.get("role"))
+            or _norm(match.group(1) if match else None)
+            or _norm(head)
+            or _norm(metadata.get("role"))
+            or "user"
+        )
+        if role != "user":
+            return answer("skipped_non_user_turn")
+        if _is_filler(content):
+            return answer("skipped_low_value")
+        receipt = (body.get("user_id"), speaker, body.get("occurred_at"), text)
+        if receipt in self.receipts:
+            return answer("skipped_replay", already=True)
+        self.receipts.add(receipt)
+        fact_md = {
+            k: v
+            for k, v in metadata.items()
+            if k not in _RESERVED and (v is None or isinstance(v, (str, int, float, bool)))
+        }
+        fact_md.update({"write_origin": "turn-extraction", "turn_role": "user"})
+        self.rows.append(
+            {
+                "id": self._alloc(),
+                "user_id": body.get("user_id"),
+                "text": content,
+                "source": body.get("source"),
+                "metadata": fact_md,
+            }
+        )
+        return answer("distilling", request_id=uuid.uuid4().hex)
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -85,6 +192,10 @@ class MockMemorySync:
             status = self.fail_next
             self.fail_next = None
             return httpx.Response(status, json={"detail": "injected failure"})
+        if self.fail_next_add_turn is not None and path == "/v1/memory/add_turn":
+            status = self.fail_next_add_turn
+            self.fail_next_add_turn = None
+            return httpx.Response(status, json={"detail": "injected failure"})
         quota = self._quota(method, path)
         if quota is not None:
             return quota
@@ -95,24 +206,7 @@ class MockMemorySync:
         body = json.loads(request.content.decode("utf-8") or "{}") if request.content else {}
 
         if method == "POST" and path == "/v1/memory/add_turn":
-            seed = f"{body.get('speaker')}:{body.get('text')}"
-            for row in self.rows:
-                if row.get("_seed") == seed:
-                    return httpx.Response(
-                        201,
-                        json={"memory_id": f"m_{row['id']}", "status": "exists", "already_exists": True},
-                    )
-            row = {
-                "id": self._alloc(),
-                "user_id": body.get("user_id"),
-                "text": body.get("text"),
-                "speaker": body.get("speaker"),
-                "source": body.get("source"),
-                "metadata": body.get("metadata"),
-                "_seed": seed,
-            }
-            self.rows.append(row)
-            return httpx.Response(201, json={"memory_id": f"m_{row['id']}", "status": "created"})
+            return self._add_turn(body)
 
         if method == "POST" and path == "/v1/memory/recall":
             if self.recall_returns_empty:

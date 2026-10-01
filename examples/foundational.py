@@ -3,8 +3,10 @@
 #
 # MemorySyncMemoryService sits between the user context aggregator and the
 # LLM: every LLMContextFrame is enriched with relevant long-term memories
-# under a hard time budget, and new turns are persisted in the background.
-# A slow or unreachable memory backend can never stall the voice reply.
+# under a hard time budget, and the caller's new turns are sent to fact
+# extraction in the background (only the durable facts are stored; the
+# bot's replies are not). A slow or unreachable memory backend can never
+# stall the voice reply.
 #
 # Run (choose any transport supported by the Pipecat runner):
 #
@@ -88,7 +90,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             transport.input(),
             stt,
             context_aggregator.user(),
-            memory,  # enrich with memories + capture new turns, on budget
+            memory,  # enrich with memories + send the caller's new turns, on budget
             llm,
             tts,
             transport.output(),

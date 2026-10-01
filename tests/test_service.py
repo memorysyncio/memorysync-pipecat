@@ -3,8 +3,9 @@
 The service runs inside Pipecat's OWN test harness
 (``pipecat.tests.utils.run_test``) — the same rig Daily uses for the
 built-in services — with real ``LLMContext`` objects and real frame flow.
-The contracts above all: recall never outlives its budget, capture is
-delta-only, and the context frame ALWAYS reaches the LLM.
+The contracts above all: recall never outlives its budget, capture sends
+only the caller's NEW turns (delta-only, never the assistant's replies),
+and the context frame ALWAYS reaches the LLM.
 """
 
 from __future__ import annotations
@@ -45,10 +46,11 @@ async def drive(service: Any, *contexts: LLMContext) -> None:
     )
 
 
-async def drain(mock, expected_rows: int, timeout: float = 5.0) -> None:
+async def drain(mock, *, calls: int, timeout: float = 5.0) -> None:
+    """Wait until ``calls`` add_turn requests have reached the mock."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if len(mock.rows) >= expected_rows:
+        if mock.add_turn_calls() >= calls:
             return
         await asyncio.sleep(0.05)
 
@@ -57,7 +59,7 @@ async def drain(mock, expected_rows: int, timeout: float = 5.0) -> None:
 
 
 async def test_enriches_context_as_system_message_with_guard(mock, make_service):
-    mock.seed("caller-1", "human: I love teal dashboards")
+    mock.seed("caller-1", "I love teal dashboards")
     service = make_service()
     ctx = context_of([
         {"role": "system", "content": "You are a helpful voice agent."},
@@ -75,7 +77,7 @@ async def test_enriches_context_as_system_message_with_guard(mock, make_service)
 
 
 async def test_recall_budget_is_hard_and_the_frame_still_flows(mock, make_service):
-    mock.seed("caller-1", "human: I love teal dashboards")
+    mock.seed("caller-1", "I love teal dashboards")
     mock.delay_s = 5.0
     service = make_service(
         params=MemorySyncMemoryService.InputParams(recall_timeout=0.4)
@@ -103,8 +105,8 @@ async def test_short_prompts_and_empty_recall_leave_context_untouched(mock, make
     assert [m["role"] for m in empty.get_messages()] == ["user"]
 
 
-async def test_recall_falls_back_to_query_for_verbatim_turns(mock, make_service):
-    mock.seed("caller-1", "human: the launch is on Friday")
+async def test_recall_falls_back_to_query(mock, make_service):
+    mock.seed("caller-1", "The launch is on Friday")
     mock.recall_returns_empty = True
     service = make_service()
     ctx = context_of([{"role": "user", "content": "when is the launch happening?"}])
@@ -114,7 +116,7 @@ async def test_recall_falls_back_to_query_for_verbatim_turns(mock, make_service)
 
 
 async def test_same_query_pays_recall_once(mock, make_service):
-    mock.seed("caller-1", "human: I love teal dashboards")
+    mock.seed("caller-1", "I love teal dashboards")
     service = make_service()
     ctx1 = context_of([{"role": "user", "content": "what colours do I like?"}])
     ctx2 = context_of([{"role": "user", "content": "what colours do I like?"}])
@@ -124,7 +126,7 @@ async def test_same_query_pays_recall_once(mock, make_service):
 
 async def test_content_parts_are_understood(mock, make_service):
     """Universal context content can be a list of parts, not just a str."""
-    mock.seed("caller-1", "human: I love teal dashboards")
+    mock.seed("caller-1", "I love teal dashboards")
     service = make_service()
     ctx = context_of([
         {"role": "user", "content": [{"type": "text", "text": "what colours do I like?"}]},
@@ -133,14 +135,14 @@ async def test_content_parts_are_understood(mock, make_service):
     assert any(m["role"] == "system" for m in ctx.get_messages())
 
 
-# ── capture: delta-only ───────────────────────────────────────────────
+# ── capture: the caller's turns only, delta-only ──────────────────────
 
 
-async def test_capture_is_delta_only_never_o_n_squared(mock, make_service):
+async def test_capture_sends_only_new_user_turns(mock, make_service):
     service = make_service()
     turn1 = context_of([{"role": "user", "content": "switch the dashboard to teal"}])
     await drive(service, turn1)
-    await drain(mock, 1)
+    await drain(mock, calls=1)
 
     turn2 = context_of([
         {"role": "user", "content": "switch the dashboard to teal"},
@@ -148,62 +150,117 @@ async def test_capture_is_delta_only_never_o_n_squared(mock, make_service):
         {"role": "user", "content": "and make the font larger"},
     ])
     await drive(service, turn2)
-    await drain(mock, 3)
+    await drain(mock, calls=2)
 
-    texts = sorted(r["text"] for r in mock.rows)
-    assert texts == [
-        "ai: Done — teal it is.",
-        "human: and make the font larger",
-        "human: switch the dashboard to teal",
+    # THE delta guarantee: 2 new user messages = exactly 2 add_turn calls.
+    # A full-context re-send would have made 3+, and the assistant reply
+    # is never sent (assistant replies are not stored as memories).
+    assert mock.add_turn_calls() == 2
+    bodies = mock.add_turn_bodies()
+    assert [b["text"] for b in bodies] == [
+        "switch the dashboard to teal",
+        "and make the font larger",
     ]
-    # THE delta guarantee: 3 stored messages = exactly 3 add_turn calls.
-    # A full-context re-store (the competitor pattern) would have made 4+.
-    assert mock.add_turn_calls() == 3
+    assert all(b["role"] == "user" for b in bodies)
+    assert sorted(f["text"] for f in mock.facts()) == [
+        "and make the font larger",
+        "switch the dashboard to teal",
+    ]
 
 
-async def test_capture_seeds_and_scoping(mock, make_service):
+async def test_capture_seeds_scoping_and_plain_user_text(mock, make_service):
+    from pipecat_memorysync import __version__
+
     service = make_service()
     ctx = context_of([{"role": "user", "content": "remember the launch is Friday"}])
     await drive(service, ctx)
-    await drain(mock, 1)
+    await drain(mock, calls=1)
 
-    row = mock.rows[0]
-    assert row["source"] == "pipecat"
-    assert row["metadata"]["session_id"] == "pipecat::conv-42"
+    [body] = mock.add_turn_bodies()
+    assert body["role"] == "user"
+    assert body["text"] == "remember the launch is Friday"  # plain, no role prefix
+    assert body["source"] == "pipecat"
+    assert body["metadata"] == {"session_id": "pipecat::conv-42"}
     expected = fnv1a64("human:remember the launch is Friday")
-    assert row["speaker"] == f"human@pipecat::conv-42#h{expected}"
+    assert body["speaker"] == f"human@pipecat::conv-42#h{expected}"
+    request = next(r for r in mock.requests if r.url.path == "/v1/memory/add_turn")
+    assert request.headers["user-agent"] == f"pipecat-memorysync/{__version__}"
+
+    # Only the extracted fact is stored, carrying the session envelope.
+    [fact] = mock.facts()
+    assert fact["text"] == "remember the launch is Friday"
+    assert fact["metadata"] == {
+        "session_id": "pipecat::conv-42",
+        "write_origin": "turn-extraction",
+        "turn_role": "user",
+    }
 
 
-async def test_injected_memories_never_reenter_storage(mock, make_service):
-    mock.seed("caller-1", "human: I love teal dashboards")
+async def test_injected_memories_are_never_sent(mock, make_service):
+    mock.seed("caller-1", "I love teal dashboards")
     service = make_service()
     turn1 = context_of([{"role": "user", "content": "what colours do I like?"}])
     await drive(service, turn1)
-    await drain(mock, 2)  # seed + the user turn
+    await drain(mock, calls=1)
 
     # The next turn's context INCLUDES the injected system message.
     enriched_messages = turn1.get_messages()
+    assert any("via MemorySync" in str(m["content"]) for m in enriched_messages)
     turn2_messages = enriched_messages + [
         {"role": "assistant", "content": "You like teal."},
         {"role": "user", "content": "great, anything else?"},
     ]
     await drive(service, context_of(turn2_messages))
-    await asyncio.sleep(0.3)
+    await drain(mock, calls=2)
+    await asyncio.sleep(0.1)
 
-    stored = [r["text"] for r in mock.rows]
-    assert not any("via MemorySync" in t for t in stored), "injections never re-enter memory"
+    sent = [b["text"] for b in mock.add_turn_bodies()]
+    assert sent == ["what colours do I like?", "great, anything else?"]
+    assert not any("via MemorySync" in t for t in sent), "injections are never sent"
 
 
 async def test_user_role_injection_is_also_excluded_from_capture(mock, make_service):
-    mock.seed("caller-1", "human: I love teal dashboards")
+    mock.seed("caller-1", "I love teal dashboards")
     service = make_service(
         params=MemorySyncMemoryService.InputParams(add_as_system_message=False)
     )
     ctx = context_of([{"role": "user", "content": "what colours do I like?"}])
     await drive(service, ctx)
     await asyncio.sleep(0.4)
-    stored = [r["text"] for r in mock.rows]
-    assert not any("via MemorySync" in t for t in stored)
+    assert any(
+        m["role"] == "user" and "via MemorySync" in m["content"] for m in ctx.get_messages()
+    ), "the injection rode a user-role message"
+    assert [b["text"] for b in mock.add_turn_bodies()] == ["what colours do I like?"]
+
+
+async def test_assistant_only_context_sends_nothing(mock, make_service):
+    """A frame whose only messages are instructions and the bot's own
+    words has no caller turn to send."""
+    service = make_service()
+    ctx = context_of([
+        {"role": "system", "content": "You are a helpful voice agent."},
+        {"role": "assistant", "content": "Hi! I'm your assistant — how can I help?"},
+    ])
+    await drive(service, ctx)
+    await asyncio.sleep(0.2)
+    assert mock.add_turn_calls() == 0
+    assert mock.facts() == []
+
+
+async def test_resend_after_reconnect_is_not_extracted_twice(mock, make_service):
+    """A fresh service instance (a reconnect, another worker) re-sending
+    the same user turn converges server-side: the deterministic seed makes
+    it a replay, so no second fact is extracted."""
+    turn = [{"role": "user", "content": "my flight lands at nine tonight"}]
+    await drive(make_service(), context_of(turn))
+    await drain(mock, calls=1)
+    await drive(make_service(), context_of(turn))
+    await drain(mock, calls=2)
+
+    bodies = mock.add_turn_bodies()
+    assert len(bodies) == 2 and bodies[0]["speaker"] == bodies[1]["speaker"]
+    assert mock.outcomes == ["distilling", "skipped_replay"]
+    assert [f["text"] for f in mock.facts()] == ["my flight lands at nine tonight"]
 
 
 # ── quota + failure matrix ────────────────────────────────────────────
@@ -217,6 +274,7 @@ async def test_quota_modes_stay_silent_and_frames_flow(mock, make_service):
         await drive(service, ctx)  # run_test asserts the frame reached downstream
         assert not any(m["role"] == "system" for m in ctx.get_messages()), mode
     mock.quota_mode = None
+    assert mock.facts() == []
 
 
 async def test_dead_server_never_stalls_or_raises(make_service):
@@ -238,7 +296,7 @@ async def test_dead_server_never_stalls_or_raises(make_service):
 
 
 async def test_conveniences_answer(mock, make_service):
-    mock.seed("caller-1", "human: I love teal dashboards")
+    mock.seed("caller-1", "I love teal dashboards")
     service = make_service()
     block = await service.get_context_block("what does this caller like?")
     assert "teal" in block
@@ -255,7 +313,7 @@ async def test_missing_user_id_is_loud_at_construction(mock):
 # ── capture: immediate and loss-proof ─────────────────────────────────
 
 
-async def test_current_utterance_stores_before_any_reply(mock, make_service):
+async def test_current_utterance_is_sent_before_any_reply(mock, make_service):
     """The user's words must be in flight the moment the frame passes —
     BEFORE the LLM replies — so a disconnect can never lose them."""
     service = make_service()
@@ -263,17 +321,17 @@ async def test_current_utterance_stores_before_any_reply(mock, make_service):
         {"role": "user", "content": "My age is twenty two and I completed my bachelor's."},
     ])
     await drive(service, ctx)
-    await drain(mock, 1)
-    assert [r["text"] for r in mock.rows] == [
-        "human: My age is twenty two and I completed my bachelor's."
+    await drain(mock, calls=1)
+    assert [f["text"] for f in mock.facts()] == [
+        "My age is twenty two and I completed my bachelor's."
     ]
 
 
 async def test_demo_disconnect_sequence_loses_nothing(mock, make_service):
     """The exact sequence that lost data in 1.1.0: greeting frame, then a
     frame carrying the reply + the important utterance, then immediate
-    CancelFrame (browser disconnect). Every message must already be
-    stored — nothing may depend on a post-cancel flush window."""
+    teardown (browser disconnect). Every user message must already be
+    sent — nothing may depend on a post-cancel flush window."""
     service = make_service()
     f1 = context_of([{"role": "user", "content": "Hello there, anyone home?"}])
     f2 = context_of([
@@ -282,29 +340,29 @@ async def test_demo_disconnect_sequence_loses_nothing(mock, make_service):
         {"role": "user", "content": "My age is twenty two and I completed my bachelor's."},
     ])
     await drive(service, f1, f2)  # run_test tears the pipeline down right after
-    await drain(mock, 3)
-    texts = sorted(r["text"] for r in mock.rows)
-    assert texts == [
-        "ai: Hi! How can I help you today?",
-        "human: Hello there, anyone home?",
-        "human: My age is twenty two and I completed my bachelor's.",
+    await drain(mock, calls=2)
+    assert sorted(f["text"] for f in mock.facts()) == [
+        "Hello there, anyone home?",
+        "My age is twenty two and I completed my bachelor's.",
     ]
+    assert mock.add_turn_calls() == 2, "the assistant reply is not sent"
 
 
-async def test_failed_store_releases_message_for_retry(mock, make_service):
-    """A store that never landed must not consume its message — the next
-    frame re-captures and retries, converging on one row."""
+async def test_failed_send_releases_message_for_retry(mock, make_service):
+    """A send that never landed must not consume its message — the next
+    frame re-captures and retries, converging on one fact."""
     service = make_service()
-    mock.fail_next = 503
+    mock.fail_next_add_turn = 503
     turn = [
         {"role": "user", "content": "remember that I fly out of Hyderabad"},
         {"role": "assistant", "content": "Noted!"},
     ]
     await drive(service, context_of(turn))
-    await asyncio.sleep(0.3)  # the 503 lands on exactly one of the two stores
+    await asyncio.sleep(0.3)
+    assert mock.add_turn_calls() == 1 and mock.facts() == [], "the 503 hit the send"
 
     await drive(service, context_of(turn))  # same context re-seen → retry
-    await drain(mock, 2)
+    await drain(mock, calls=2)
 
-    texts = sorted(r["text"] for r in mock.rows)
-    assert texts == ["ai: Noted!", "human: remember that I fly out of Hyderabad"]
+    assert mock.add_turn_calls() == 2, "one retry, and never the assistant reply"
+    assert [f["text"] for f in mock.facts()] == ["remember that I fly out of Hyderabad"]

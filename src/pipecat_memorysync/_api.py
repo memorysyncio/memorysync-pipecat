@@ -1,10 +1,10 @@
 """Async client for the MemorySync v1 data plane used by this integration.
 
-Conversation turns persist through the *episodic* ingestion path
-(``POST /v1/memory/add_turn``), which stores text verbatim — no fact
-extraction, no low-value-chatter gate, no rewriting. A voice transcript
-must round-trip byte-for-byte; a plane that second-guessed it would
-corrupt the caller's history.
+The caller's turns go to ``POST /v1/memory/add_turn``, where the server
+extracts the durable facts a user turn contains (preferences, plans,
+details) and stores only those as memories, asynchronously, each with its
+own id. The turn text itself is not stored, assistant replies are not
+stored as memories, and filler such as "ok" or "thanks" stores nothing.
 
 Everything here is async-native because Pipecat drives every processor
 from the event loop — a blocking HTTP client inside ``process_frame``
@@ -55,8 +55,9 @@ def fnv1a64(value: str) -> str:
 
     Over UTF-16 code units — not code points, not UTF-8 bytes — so the
     output matches the JavaScript adapters character for character.
-    Identical seeds across languages mean a turn persisted by a Python
-    surface and again by a JS surface converge on one stored row.
+    Identical seeds across languages mean a turn sent by a Python surface
+    and again by a JS surface is recognised server-side as the same turn
+    and extracted once.
     """
     prime = 0x100000001B3
     mask = 0xFFFFFFFFFFFFFFFF
@@ -202,17 +203,29 @@ class AsyncV1Api:
         tenant_id: str,
         user_id: str,
         text: str,
+        role: Optional[str] = None,
         speaker: Optional[str] = None,
         occurred_at: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         source: str = "pipecat",
         sync_embed: bool = False,
     ) -> Dict[str, Any]:
-        """Store one item verbatim (episodic ingestion).
+        """Send one turn to fact extraction.
 
-        ``speaker`` + ``occurred_at`` participate in the server's
-        idempotency seed, so retrying an identical payload is recognised
-        (``already_exists: true``) instead of stored twice.
+        ``role`` (``"user"`` or ``"assistant"``) says who spoke; the
+        memory service only ever sends ``"user"``. Only user turns are
+        extracted, and only the durable facts in them are stored as
+        memories, carrying the scalar values of ``metadata``. There is no
+        memory per turn (``memory_id`` is always ``None``);
+        ``processing_status`` says what happened: ``"distilling"`` (facts
+        are being extracted; ``request_id`` correlates the job),
+        ``"skipped_low_value"`` (filler), ``"skipped_non_user_turn"``
+        (assistant turns are not stored as memories), ``"skipped_replay"``
+        (already sent) or ``"skipped"`` (monthly quota reached).
+
+        ``speaker`` + ``occurred_at`` + ``text`` identify the turn:
+        sending the same turn again is recognised (``already_exists:
+        true``) and not extracted twice.
         """
         body: Dict[str, Any] = {
             "tenant_id": tenant_id,
@@ -221,6 +234,8 @@ class AsyncV1Api:
             "text": text,
             "sync_embed": sync_embed,
         }
+        if role is not None:
+            body["role"] = role
         if speaker is not None:
             body["speaker"] = speaker
         if occurred_at is not None:
@@ -258,7 +273,7 @@ class AsyncV1Api:
         prompt: str,
         k: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Plain semantic search over the pair's memories (episodic included)."""
+        """Plain semantic search over the pair's memories."""
         body: Dict[str, Any] = {
             "tenant_id": tenant_id,
             "user_id": user_id,

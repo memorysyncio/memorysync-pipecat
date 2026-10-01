@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "pipecat-memorysync"
 dynamic = ["version"]
-description = "MemorySync for Pipecat: budgeted memory recall that never stalls a voice reply, delta-only conversation persistence with idempotency seeds, and a pipeline that cannot be broken by a memory outage."
+description = "MemorySync for Pipecat: budgeted memory recall that never stalls a voice reply, delta-only fact capture from the caller's turns with idempotency seeds, and a pipeline that cannot be broken by a memory outage."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

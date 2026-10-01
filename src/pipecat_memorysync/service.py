@@ -7,20 +7,22 @@ predecessors don't:
 1. **Recall is budgeted.** Enrichment waits at most ``recall_timeout``
    seconds (default 1.2). On timeout or failure the context frame passes
    through unenriched — a voice reply is never stalled by a slow network.
-2. **Capture is immediate and delta-only.** Every NEW user/assistant
-   message is sent to the platform the moment it appears in a context
+2. **Capture is immediate and delta-only.** Every NEW user (caller)
+   message is sent to fact extraction the moment it appears in a context
    frame — the current utterance is already in flight BEFORE the LLM
-   replies, so a disconnect can never lose it. Junk filtering and fact
-   extraction are the platform's job (the low-value gate + conversational
-   ingestion), not the client's. Only new messages are sent each frame,
-   with cross-adapter fnv1a64 idempotency seeds.
+   replies, so a disconnect can never lose it. Only the durable facts in
+   what the caller said are stored as memories; assistant replies are
+   not sent. Filler filtering and fact extraction are the platform's
+   job, not the client's. Only new messages are sent each frame, with
+   cross-adapter fnv1a64 idempotency seeds, so a retried turn is
+   recognised server-side and not extracted twice.
 3. **Nothing raises, nothing is dropped.** Every failure path logs and
    pushes the ORIGINAL frame through. The pipeline cannot stall and the
    LLM always gets its context.
 
 Injected memories ride a ``system`` message, and the capture path reads
-only ``user``/``assistant`` roles — so the service can never re-learn
-its own injections.
+only ``user`` messages (skipping one that starts with the injection
+header) — so the service can never re-learn its own injections.
 """
 
 from __future__ import annotations
@@ -68,7 +70,8 @@ def _message_text(message: Dict[str, Any]) -> str:
 
 
 class MemorySyncMemoryService(FrameProcessor):
-    """Automatic conversation persistence and budgeted recall for Pipecat.
+    """Automatic fact capture from the caller's turns and budgeted recall
+    for Pipecat.
 
     Place it between the user context aggregator and the LLM::
 
@@ -82,7 +85,7 @@ class MemorySyncMemoryService(FrameProcessor):
             transport.input(),
             stt,
             user_aggregator,
-            memory,            # ← enriches context, persists deltas
+            memory,            # ← enriches context, sends new user turns
             llm,
             tts,
             transport.output(),
@@ -141,8 +144,8 @@ class MemorySyncMemoryService(FrameProcessor):
         self.params = params
 
         self._stored_seeds: Set[str] = set()
-        # Message-level ledger: which context messages have been sent.
-        # A failed store releases its message so the next frame retries.
+        # Message-level ledger: which user messages have been sent.
+        # A failed send releases its message so the next frame retries.
         self._seen_messages: Set[str] = set()
         self._store_tasks: Set[asyncio.Task] = set()
         self._last_query: Optional[str] = None
@@ -166,7 +169,7 @@ class MemorySyncMemoryService(FrameProcessor):
 
         if isinstance(frame, EndFrame):
             # A graceful end must not lose the call's final exchange:
-            # let queued stores land (bounded) before the pipeline stops.
+            # let queued sends land (bounded) before the pipeline stops.
             await self._flush(timeout=3.0)
             await self.push_frame(frame, direction)
             return
@@ -247,70 +250,70 @@ class MemorySyncMemoryService(FrameProcessor):
     # ── capture: immediate, delta-only, background ─────────────────────
 
     def _capture_delta(self, context: Any) -> None:
-        """Queue storage for NEW messages the moment they appear.
+        """Queue NEW user messages for fact extraction the moment they appear.
 
-        The platform owns junk filtering (the low-value gate) and fact
-        extraction (conversational ingestion), so the adapter's single
-        duty is delivering every turn reliably and EARLY. The current
-        user utterance is in the frame BEFORE the LLM replies — sending
-        it immediately means a mid-call disconnect can never lose it.
-        (1.1.0 deferred the current utterance until the turn completed;
-        that deferral raced the disconnect salvage window and could drop
-        the newest — usually most important — turn. Never again.)
+        The platform owns filler filtering and fact extraction, so the
+        adapter's single duty is delivering every user turn reliably and
+        EARLY. The current user utterance is in the frame BEFORE the LLM
+        replies — sending it immediately means a mid-call disconnect can
+        never lose it. (1.1.0 deferred the current utterance until the
+        turn completed; that deferral raced the disconnect salvage window
+        and could drop the newest — usually most important — turn. Never
+        again.) Assistant messages are not sent: assistant replies are
+        not stored as memories.
         """
         header = self.params.system_prompt
         for message in context.get_messages():
-            role = message.get("role")
-            if role not in ("user", "assistant"):
-                continue
+            if message.get("role") != "user":
+                continue  # assistant/system/tool messages are never sent
             text = _message_text(message)
             if not text or text.startswith(header):
                 continue  # our own injection (user-role mode) never re-enters
-            speaker_role = "human" if role == "user" else "ai"
             trimmed = text if len(text) <= MAX_TURN_CHARS else text[:MAX_TURN_CHARS] + "…"
-            key = f"{speaker_role}:{trimmed}"
+            key = f"human:{trimmed}"
             if key in self._seen_messages:
                 continue
             self._seen_messages.add(key)
             self._bound_seen()
-            self._queue_store(speaker_role, trimmed, [key])
+            self._queue_store(trimmed, [key])
 
     def _bound_seen(self) -> None:
         if len(self._seen_messages) > 4096:
             self._seen_messages.clear()
 
-    def _queue_store(self, speaker_role: str, text: str, msg_keys: List[str]) -> None:
-        seed = f"{speaker_role}:{text}"
+    def _queue_store(self, text: str, msg_keys: List[str]) -> None:
+        # The cross-adapter seed scheme names the caller "human".
+        seed = f"human:{text}"
         if seed in self._stored_seeds:
             return
         self._stored_seeds.add(seed)
         if len(self._stored_seeds) > 4096:
             self._stored_seeds.clear()
         # Plain asyncio tasks, tracked locally: pipeline teardown must
-        # not cancel a persist mid-flight — _flush owns their fate.
-        task = asyncio.create_task(self._store_turn(speaker_role, text, seed, msg_keys))
+        # not cancel a send mid-flight — _flush owns their fate.
+        task = asyncio.create_task(self._store_turn(text, seed, msg_keys))
         self._store_tasks.add(task)
         task.add_done_callback(self._store_tasks.discard)
 
-    async def _store_turn(
-        self, speaker_role: str, text: str, seed: str, msg_keys: List[str]
-    ) -> None:
+    async def _store_turn(self, text: str, seed: str, msg_keys: List[str]) -> None:
+        """Send one user turn: plain text, ``role: "user"``."""
         try:
             tenant = await self._api.resolve_tenant_id()
             await self._api.add_turn(
                 tenant_id=tenant,
                 user_id=self.user_id,
-                text=f"{speaker_role}: {text}",
-                speaker=f"{speaker_role}@{self.scope}#h{fnv1a64(seed)}",
+                text=text,
+                role="user",
+                speaker=f"human@{self.scope}#h{fnv1a64(seed)}",
                 metadata={"session_id": self.scope},
             )
         except Exception as exc:  # noqa: BLE001
-            # The write never landed: release both ledgers so the next
-            # frame re-captures this message and retries the store.
+            # The send never landed: release both ledgers so the next
+            # frame re-captures this message and retries it.
             self._stored_seeds.discard(seed)
             for key in msg_keys:
                 self._seen_messages.discard(key)
-            logger.debug(f"memorysync: store failed: {exc}")
+            logger.debug(f"memorysync: send failed: {exc}")
 
     # ── conveniences (outside the pipeline) ───────────────────────────
 
@@ -338,7 +341,7 @@ class MemorySyncMemoryService(FrameProcessor):
     # ── lifecycle ──────────────────────────────────────────────────────
 
     async def _flush(self, *, timeout: float) -> None:
-        """Let queued stores land, bounded. Never raises."""
+        """Let queued sends land, bounded. Never raises."""
         pending = [t for t in self._store_tasks if not t.done()]
         if not pending:
             return
@@ -350,7 +353,7 @@ class MemorySyncMemoryService(FrameProcessor):
             pass
 
     async def aclose(self) -> None:
-        """Flush pending stores and close the HTTP client. Optional —
+        """Flush pending sends and close the HTTP client. Optional —
         call from application shutdown; the service itself stays usable
         across multiple pipeline runs."""
         await self._flush(timeout=3.0)
